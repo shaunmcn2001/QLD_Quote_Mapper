@@ -1,8 +1,10 @@
 param location string = resourceGroup().location
 param environmentName string
 param containerImage string
+
 @secure()
 param apiKey string
+
 param qldMapserverBase string = 'https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer'
 
 resource la 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
@@ -42,10 +44,6 @@ resource api 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'x-api-key'
           value: apiKey
         }
-        {
-          name: 'qld-mapserver-base'
-          value: qldMapserverBase
-        }
       ]
       activeRevisionsMode: 'single'
     }
@@ -55,13 +53,15 @@ resource api 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'api'
           image: containerImage
           env: [
+            // Secret env (API key)
             {
               name: 'X_API_KEY'
               secretRef: 'x-api-key'
             }
+            // Non-secret env (base URL)
             {
               name: 'QLD_MAPSERVER_BASE'
-              secretRef: 'qld-mapserver-base'
+              value: qldMapserverBase
             }
           ]
           resources: {
