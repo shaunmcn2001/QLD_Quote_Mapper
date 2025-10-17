@@ -1,0 +1,14 @@
+name: parcel-aca-swa-qld
+metadata:
+  template: parcel-aca-swa-qld@0.1.0
+services:
+  api:
+    project: ./
+    language: js
+    host: containerapp
+    docker:
+      path: ./Dockerfile
+  web:
+    project: ./frontend
+    language: js
+    host: staticwebapp
