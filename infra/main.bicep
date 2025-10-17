@@ -1,10 +1,17 @@
+@description('Azure region for resources')
 param location string = resourceGroup().location
+
+@description('Environment name used in resource names')
 param environmentName string
+
+@description('OCI reference for your built image (set by azd)')
 param containerImage string
 
 @secure()
+@description('API key required by the backend')
 param apiKey string
 
+@description('QLD MapServer base URL')
 param qldMapserverBase string = 'https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer'
 
 resource la 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
@@ -53,12 +60,10 @@ resource api 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'api'
           image: containerImage
           env: [
-            // Secret env (API key)
             {
               name: 'X_API_KEY'
               secretRef: 'x-api-key'
             }
-            // Non-secret env (base URL)
             {
               name: 'QLD_MAPSERVER_BASE'
               value: qldMapserverBase
@@ -78,22 +83,4 @@ resource api 'Microsoft.App/containerApps@2023-05-01' = {
   }
 }
 
-resource swa 'Microsoft.Web/staticSites@2022-09-01' = {
-  name: 'swa-${environmentName}'
-  location: location
-  sku: {
-    name: 'Free'
-  }
-  properties: {
-    repositoryUrl: ''
-    branch: ''
-    buildProperties: {
-      appLocation: 'frontend'
-      appBuildCommand: 'npm run build'
-      outputLocation: 'dist'
-    }
-  }
-}
-
 output apiUrl string = 'https://${api.properties.configuration.ingress.fqdn}'
-output swaName string = swa.name
