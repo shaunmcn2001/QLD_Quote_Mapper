@@ -29,3 +29,9 @@ cd frontend && npm i && VITE_API_BASE=http://localhost:8000 npm run dev
    - `QLD_MAPSERVER_BASE` – optional; defaults to the QLD Planning Cadastre MapServer.
    - `ARCGIS_AUTH_TOKEN` – optional; leave blank unless you have a token.
 4. Deploy; Render will build the Docker image and run `uvicorn` on the port it assigns.
+
+When running the local frontend against the deployed backend, start Vite with:
+```bash
+cd frontend
+VITE_API_BASE=https://qld-quote-mapper.onrender.com npm run dev
+```
