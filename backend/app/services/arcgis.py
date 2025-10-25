@@ -47,13 +47,12 @@ def _query(layer_index: int, params: dict) -> dict:
 def _sql_escape(v: str) -> str:
     return v.replace("'", "''")
 
-_PLAN_PREFIXES = {"RP","SP","CP","DP","CH","CC","BUP","GTP","HBL","HBP"}
 _LOTPLAN_WITH_SPACE = re.compile(
-    r"^(?P<lot>\d+[A-Z]?)\s+(?P<prefix>[A-Z]{1,4})\s*(?P<number>\d+)$",
+    r"^(?P<lot>\d+[A-Z]?)\s+(?P<prefix>[A-Z]+)\s*(?P<number>\d+)$",
     re.IGNORECASE,
 )
 _LOTPLAN_COMPACT = re.compile(
-    r"^(?P<lot>\d+[A-Z]?)(?P<prefix>RP|SP|CP|DP|CH|CC|BUP|GTP|HBL|HBP)(?P<number>\d+)$",
+    r"^(?P<lot>\d+[A-Z]?)(?P<prefix>[A-Z]+)(?P<number>\d+)$",
     re.IGNORECASE,
 )
 
@@ -74,8 +73,6 @@ def _parse_lotplan_token(token: str) -> Optional[Tuple[str, str, str]]:
     lot = m.group("lot").upper()
     prefix = m.group("prefix").upper()
     number = m.group("number")
-    if prefix not in _PLAN_PREFIXES:
-        return None
     plan = f"{prefix}{number}"
     compact = f"{lot}{plan}"
     return compact, lot, plan
