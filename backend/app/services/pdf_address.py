@@ -43,7 +43,7 @@ def parse_au_address_structured(text: str) -> List[Dict[str, Any]]:
         results.append({
             "original": ln,
             "property_name": prop,
-            "house_number": int(re.sub(r"[^0-9]", "", num)) if num else None,
+            "house_number": num.strip().upper() if num else None,
             "street": street.upper(),
             "suffix": suffix,
             "suburb": suburb,

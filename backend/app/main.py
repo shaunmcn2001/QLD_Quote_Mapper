@@ -4,11 +4,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from io import BytesIO
+import re
 import os
 
 from app.services.pdf_address import (
     extract_text_from_pdf,
-    parse_addresses_from_text,
     parse_lotplan_from_text,
     parse_au_address_structured
 )
@@ -17,6 +17,7 @@ from app.services.arcgis import (
     query_parcels_by_lotplan,
     query_parcels_from_address,
     to_kmz,
+    normalize_lotplan,
 )
 
 API_KEY = os.getenv("X_API_KEY", "")
@@ -33,7 +34,7 @@ app.add_middleware(
 
 class AddressIn(BaseModel):
     property_name: Optional[str] = None
-    house_number: Optional[int] = None
+    house_number: Optional[str] = None
     street: Optional[str] = None
     suffix: Optional[str] = None
     suburb: Optional[str] = None
@@ -41,9 +42,35 @@ class AddressIn(BaseModel):
     postcode: Optional[int] = None
     original: Optional[str] = None
 
+class AddressLookup(BaseModel):
+    address: str
+    relax_no_number: bool = False
+    max_results: int = 500
+    property_name: Optional[str] = None
+
+_LOTPLAN_FINDER = re.compile(
+    r"\d+[A-Z]?(?:\s*/\s*|\s*[-]?\s*)?(?:RP|SP|CP|DP|CH|CC|BUP|GTP|HBL|HBP)\s*\d+",
+    re.IGNORECASE,
+)
+
 def _safe_folder_name(name: str) -> str:
     return "".join(ch for ch in name if ch.isalnum() or ch in " -_,")\
         .replace(",,", ",").strip().strip(",") or "parcels"
+
+def _kmz_stream_response(features: List[Dict[str, Any]], folder_name: str):
+    safe_name = _safe_folder_name(folder_name or "parcels")
+    kmz_bytes = to_kmz(features, folder_name=safe_name)
+    headers = {"Content-Disposition": f'attachment; filename="{safe_name}.kmz"'}
+    return StreamingResponse(BytesIO(kmz_bytes), media_type="application/vnd.google-earth.kmz", headers=headers)
+
+def _extract_lotplan_tokens(raw: str) -> List[str]:
+    if not raw:
+        return []
+    normalized = raw.replace("\n", ",").replace(";", ",")
+    tokens = [tok.strip() for tok in normalized.split(",") if tok.strip()]
+    if tokens:
+        return tokens
+    return [m.group(0) for m in _LOTPLAN_FINDER.finditer(raw)]
 
 @app.middleware("http")
 async def require_key(request: Request, call_next):
@@ -109,31 +136,62 @@ async def process_pdf_kmz(
         props = parcels[0].get("properties",{}) if parcels else {}
         folder_name = props.get("lotplan") or "parcels"
 
-    kmz_bytes = to_kmz(parcels, folder_name=_safe_folder_name(folder_name))
-    headers = {"Content-Disposition": f'attachment; filename="{_safe_folder_name(folder_name)}.kmz"'}
-    return StreamingResponse(BytesIO(kmz_bytes), media_type="application/vnd.google-earth.kmz", headers=headers)
+    return _kmz_stream_response(parcels, folder_name)
 
 @app.get("/kmz_by_lotplan")
 def kmz_by_lotplan(lotplan: str, max_results: int = Query(1000, ge=1, le=5000)):
-    tokens = [t.strip() for t in lotplan.split(",") if t.strip()]
-    if not tokens:
-        raise HTTPException(400, "Provide ?lotplan=2 RP12345 or comma-separated list.")
+    raw_tokens = _extract_lotplan_tokens(lotplan)
+    if not raw_tokens:
+        raise HTTPException(400, "Provide lot/plan tokens like '4rp30439, 3rp048958'.")
+    if len(raw_tokens) > 50:
+        raise HTTPException(400, "Too many lot/plan tokens provided (limit 50).")
+    try:
+        normalized_tokens = [normalize_lotplan(tok) for tok in raw_tokens]
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    unique_tokens = list(dict.fromkeys(normalized_tokens))
     parcels: List[Dict[str,Any]] = []
-    for tok in tokens:
+    for tok in unique_tokens:
         parcels.extend(query_parcels_by_lotplan(tok, max_results=max_results))
     if not parcels:
         raise HTTPException(404, "No parcels found for given Lot/Plan token(s).")
-    folder_name = " & ".join(tokens)[:120]
-    kmz_bytes = to_kmz(parcels, folder_name=_safe_folder_name(folder_name or "lotplans"))
-    headers = {"Content-Disposition": f'attachment; filename="{_safe_folder_name(folder_name)}.kmz"'}
-    return StreamingResponse(BytesIO(kmz_bytes), media_type="application/vnd.google-earth.kmz", headers=headers)
+    folder_name = " & ".join(unique_tokens)[:120] or "lotplans"
+    return _kmz_stream_response(parcels, folder_name)
+
+@app.post("/kmz_by_address")
+def kmz_by_address(query: AddressLookup):
+    if not query.address.strip():
+        raise HTTPException(400, "Address is required.")
+    candidates = parse_au_address_structured(query.address)
+    if not candidates:
+        candidates = [{"original": query.address.strip()}]
+    parcels: Optional[List[Dict[str, Any]]] = None
+    folder_label = query.property_name or (candidates[0].get("original") or query.address.strip())
+    for candidate in candidates[:5]:
+        candidate_payload = {**candidate}
+        if query.property_name:
+            candidate_payload["property_name"] = query.property_name
+        relax = query.relax_no_number or candidate_payload.get("house_number") in (None, "")
+        try:
+            hits = query_parcels_from_address(candidate_payload, relax_no_number=relax, max_results=query.max_results)
+        except ValueError:
+            hits = []
+        if hits:
+            parcels = hits
+            folder_label = candidate_payload.get("original") or folder_label
+            break
+    if not parcels:
+        raise HTTPException(404, "No parcels found for the provided address.")
+    if query.property_name and folder_label:
+        folder_label = f"{query.property_name} {folder_label}"
+    return _kmz_stream_response(parcels, folder_label or "address")
 
 @app.post("/kmz_by_address_fields")
 def kmz_by_address_fields(addr: AddressIn, max_results: int = Query(1000, ge=1, le=5000), relax_no_number: bool = Query(False)):
     hits = query_parcels_from_address(addr.model_dump(), relax_no_number=relax_no_number, max_results=max_results)
     if not hits:
         raise HTTPException(404, "No parcels found from provided address.")
-    folder_name = (addr.property_name + " " if addr.property_name else "") + (addr.original or f"{addr.house_number or ''} {addr.street or ''}, {addr.suburb or ''}, {addr.state or 'QLD'} {addr.postcode or ''}")
-    kmz_bytes = to_kmz(hits, folder_name=_safe_folder_name(folder_name))
-    headers = {"Content-Disposition": f'attachment; filename="{_safe_folder_name(folder_name)}.kmz"'}
-    return StreamingResponse(BytesIO(kmz_bytes), media_type="application/vnd.google-earth.kmz", headers=headers)
+    folder_name = (addr.property_name + " " if addr.property_name else "") + (
+        addr.original or f"{addr.house_number or ''} {addr.street or ''}, {addr.suburb or ''}, {addr.state or 'QLD'} {addr.postcode or ''}"
+    )
+    return _kmz_stream_response(hits, folder_name)

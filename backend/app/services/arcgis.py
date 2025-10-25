@@ -1,6 +1,8 @@
-import os, json, requests, zipfile, io
+import os, json, requests, zipfile, io, re
+from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
-from shapely.geometry import shape
+from shapely.geometry import shape, Polygon, MultiPolygon, GeometryCollection, mapping
+from shapely.ops import unary_union
 import simplekml
 
 BASE_MAPSERVER = os.getenv("QLD_MAPSERVER_BASE", "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer")
@@ -45,6 +47,45 @@ def _query(layer_index: int, params: dict) -> dict:
 def _sql_escape(v: str) -> str:
     return v.replace("'", "''")
 
+_PLAN_PREFIXES = {"RP","SP","CP","DP","CH","CC","BUP","GTP","HBL","HBP"}
+_LOTPLAN_WITH_SPACE = re.compile(
+    r"^(?P<lot>\d+[A-Z]?)\s+(?P<prefix>[A-Z]{1,4})\s*(?P<number>\d+)$",
+    re.IGNORECASE,
+)
+_LOTPLAN_COMPACT = re.compile(
+    r"^(?P<lot>\d+[A-Z]?)(?P<prefix>RP|SP|CP|DP|CH|CC|BUP|GTP|HBL|HBP)(?P<number>\d+)$",
+    re.IGNORECASE,
+)
+
+def _parse_lotplan_token(token: str) -> Optional[Tuple[str, str, str]]:
+    if not token:
+        return None
+    raw = token.strip()
+    if not raw:
+        return None
+    compact = re.sub(r"[\\/\-]+", " ", raw.strip().upper())
+    compact = re.sub(r"\s+", " ", compact)
+    m = _LOTPLAN_WITH_SPACE.match(compact)
+    if not m:
+        compact = re.sub(r"\s+", "", raw.strip().upper())
+        m = _LOTPLAN_COMPACT.match(compact)
+    if not m:
+        return None
+    lot = m.group("lot").upper()
+    prefix = m.group("prefix").upper()
+    number = m.group("number")
+    if prefix not in _PLAN_PREFIXES:
+        return None
+    plan = f"{prefix}{number}"
+    lotplan = f"{lot} {plan}"
+    return lotplan, lot, plan
+
+def normalize_lotplan(token: str) -> str:
+    parsed = _parse_lotplan_token(token)
+    if not parsed:
+        raise ValueError(f"Unsupported lot/plan token: {token}")
+    return parsed[0]
+
 def address_where(addr: Dict[str,Any], relax_no_number: bool=False) -> str:
     parts = []
     if addr.get("original"):
@@ -52,7 +93,7 @@ def address_where(addr: Dict[str,Any], relax_no_number: bool=False) -> str:
         parts.append(f"UPPER({ADDR['address']}) = UPPER('{s}')")
     if addr.get("house_number") is not None:
         parts.append(f"UPPER({ADDR['street_number']}) = UPPER('{_sql_escape(str(addr['house_number']))}')")
-    elif not relax_no_number:
+    elif not relax_no_number and not addr.get("original"):
         raise ValueError("Missing house number and relax_no_number is False")
     if addr.get("street"):
         parts.append(f"UPPER({ADDR['street_name']}) LIKE '%{_sql_escape(addr['street'])}%'")
@@ -86,8 +127,14 @@ def resolve_lotplans_from_address(addr: Dict[str,Any], relax_no_number: bool=Fal
     return lps, pt
 
 def query_parcels_by_lotplan(lotplan_token: str, max_results: int=500) -> List[Dict[str,Any]]:
-    lp = _sql_escape(lotplan_token.strip().upper())
-    data = _query(PARCELS_LAYER, {"where": f"UPPER({PAR['lotplan']}) LIKE '%{lp}%'", "resultRecordCount": max_results})
+    parsed = _parse_lotplan_token(lotplan_token)
+    if parsed:
+        _, lot, plan = parsed
+        where = f"UPPER({PAR['lot']}) = UPPER('{_sql_escape(lot)}') AND UPPER({PAR['plan']}) = UPPER('{_sql_escape(plan)}')"
+    else:
+        lp = _sql_escape(lotplan_token.strip().upper())
+        where = f"UPPER({PAR['lotplan']}) LIKE '%{lp}%'"
+    data = _query(PARCELS_LAYER, {"where": where, "resultRecordCount": max_results})
     return data.get("features", [])
 
 def query_parcels_by_point(lat: float, lon: float, max_results: int=50) -> List[Dict[str,Any]]:
@@ -119,6 +166,68 @@ def _apply_style(pol):
     pol.style.linestyle.color = Color.rgb(0xA2, 0x3F, 0x97, 255)
     pol.style.linestyle.width = 3
 
+def _collect_polygons(shp) -> List[Polygon]:
+    if shp.is_empty:
+        return []
+    if isinstance(shp, Polygon):
+        return [shp]
+    if isinstance(shp, MultiPolygon):
+        return list(shp.geoms)
+    if isinstance(shp, GeometryCollection):
+        polys: List[Polygon] = []
+        for geom in shp.geoms:
+            polys.extend(_collect_polygons(geom))
+        return polys
+    return []
+
+def _merge_features_by_lotplan(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Tuple[str, Dict[str, Any]]]] = defaultdict(list)
+    passthrough: List[Dict[str, Any]] = []
+    for feat in features:
+        props = feat.get("properties", {}) or {}
+        lp_value = props.get(PAR["lotplan"])
+        key = None
+        display = None
+        if isinstance(lp_value, str) and lp_value.strip():
+            key = re.sub(r"\s+", "", lp_value.upper())
+            display = lp_value.strip()
+        elif props.get(PAR["objectid"]) is not None:
+            key = f"OBJ_{props[PAR['objectid']]}"
+            display = str(props[PAR["objectid"]])
+        if key:
+            grouped[key].append((display or key, feat))
+        else:
+            passthrough.append(feat)
+
+    merged: List[Dict[str, Any]] = []
+    for key, entries in grouped.items():
+        display_name, first_feat = entries[0]
+        geoms = []
+        props_template: Dict[str, Any] = {}
+        for _, feat in entries:
+            geom = feat.get("geometry")
+            if not geom:
+                continue
+            shp = shape(geom)
+            if shp.is_empty:
+                continue
+            geoms.append(shp)
+            if not props_template:
+                props_template = feat.get("properties", {}) or {}
+        if not geoms:
+            continue
+        unioned = unary_union(geoms) if len(geoms) > 1 else geoms[0]
+        props_copy = {**props_template}
+        if PAR["lotplan"] not in props_copy or not props_copy.get(PAR["lotplan"]):
+            props_copy[PAR["lotplan"]] = display_name
+        merged.append({
+            "geometry": mapping(unioned),
+            "properties": props_copy,
+        })
+    if merged or passthrough:
+        return merged + passthrough
+    return features
+
 def _add_feature_to_folder(kml_folder, f):
     geom = f.get("geometry")
     props = f.get("properties", {}) or {}
@@ -128,30 +237,35 @@ def _add_feature_to_folder(kml_folder, f):
     keep = ["lot","plan","lotplan","shire_name","locality","tenure"]
     desc_lines = [f"{k}: {props.get(k)}" for k in keep if props.get(k) not in (None, "")]
     desc = "\n".join(desc_lines)
-    if shp.geom_type == "Polygon":
-        coords = list(shp.exterior.coords)
-        pol = kml_folder.newpolygon(name=name, description=desc)
-        pol.outerboundaryis = [(x, y) for (x, y) in coords]
-        for interior in getattr(shp, "interiors", []):
-            pol.innerboundaryis = [[(x, y) for (x, y) in interior.coords]]
-        _apply_style(pol)
-    elif shp.geom_type == "MultiPolygon":
-        for idx, poly in enumerate(shp.geoms):
-            coords = list(poly.exterior.coords)
-            pol = kml_folder.newpolygon(name=f"{name} ({idx+1})", description=desc)
-            pol.outerboundaryis = [(x, y) for (x, y) in coords]
-            for interior in getattr(poly, "interiors", []):
-                pol.innerboundaryis = [[(x, y) for (x, y) in interior.coords]]
-            _apply_style(pol)
+    polygons = _collect_polygons(shp)
+    if polygons:
+        if len(polygons) == 1:
+            poly = polygons[0]
+            kml_poly = kml_folder.newpolygon(name=name, description=desc)
+            kml_poly.outerboundaryis = [(x, y) for (x, y) in poly.exterior.coords]
+            interior_coords = [[(x, y) for (x, y) in interior.coords] for interior in getattr(poly, "interiors", [])]
+            if interior_coords:
+                kml_poly.innerboundaryis = interior_coords
+            _apply_style(kml_poly)
+        else:
+            multi = kml_folder.newmultigeometry(name=name, description=desc)
+            for poly in polygons:
+                kml_poly = multi.newpolygon()
+                kml_poly.outerboundaryis = [(x, y) for (x, y) in poly.exterior.coords]
+                interior_coords = [[(x, y) for (x, y) in interior.coords] for interior in getattr(poly, "interiors", [])]
+                if interior_coords:
+                    kml_poly.innerboundaryis = interior_coords
+                _apply_style(kml_poly)
     else:
-        x, y = shp.representative_point().x, shp.representative_point().y
-        kml_folder.newpoint(name=name, description=desc, coords=[(x, y)])
+        point = shp.representative_point()
+        kml_folder.newpoint(name=name, description=desc, coords=[(point.x, point.y)])
 
 def to_kmz(features: List[Dict[str,Any]], folder_name: str = "parcels") -> bytes:
     import simplekml
     kml = simplekml.Kml()
     fol = kml.newfolder(name=folder_name)
-    for f in features:
+    merged_features = _merge_features_by_lotplan(features)
+    for f in merged_features:
         _add_feature_to_folder(fol, f)
     kml_bytes = kml.kml().encode("utf-8")
     buf = io.BytesIO()
