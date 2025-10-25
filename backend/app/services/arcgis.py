@@ -63,6 +63,7 @@ def _parse_lotplan_token(token: str) -> Optional[Tuple[str, str, str]]:
     raw = token.strip()
     if not raw:
         return None
+    raw = re.sub(r"^(?:LOT\s*|L)(?=\d)", "", raw, flags=re.IGNORECASE).strip()
     compact = re.sub(r"[\\/\-]+", " ", raw.strip().upper())
     compact = re.sub(r"\s+", " ", compact)
     m = _LOTPLAN_WITH_SPACE.match(compact)
@@ -354,13 +355,27 @@ def _add_feature_to_folder(kml_folder, f):
         point = shp.representative_point()
         kml_folder.newpoint(name=name, description=desc, coords=[(point.x, point.y)])
 
-def to_kmz(features: List[Dict[str,Any]], folder_name: str = "parcels") -> bytes:
+def to_kmz(features: List[Dict[str,Any]], folder_name: str = "parcels", grouped_features: Optional[Dict[str, List[Dict[str,Any]]]] = None) -> bytes:
     import simplekml
     kml = simplekml.Kml()
-    fol = kml.newfolder(name=folder_name)
-    merged_features = _merge_features_by_lotplan(features)
-    for f in merged_features:
-        _add_feature_to_folder(fol, f)
+    if grouped_features:
+        root_folder = kml.newfolder(name=folder_name)
+        for sub_name, feats in grouped_features.items():
+            if not feats:
+                continue
+            sub_folder = root_folder.newfolder(name=sub_name)
+            merged = _merge_features_by_lotplan(feats)
+            for feat in merged:
+                _add_feature_to_folder(sub_folder, feat)
+        if features:
+            merged_features = _merge_features_by_lotplan(features)
+            for f in merged_features:
+                _add_feature_to_folder(root_folder, f)
+    else:
+        fol = kml.newfolder(name=folder_name)
+        merged_features = _merge_features_by_lotplan(features)
+        for f in merged_features:
+            _add_feature_to_folder(fol, f)
     kml_bytes = kml.kml().encode("utf-8")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
