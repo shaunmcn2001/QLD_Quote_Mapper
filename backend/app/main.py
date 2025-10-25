@@ -18,6 +18,7 @@ from app.services.arcgis import (
     query_parcels_from_address,
     to_kmz,
     normalize_lotplan,
+    best_folder_name_from_parcels,
 )
 
 API_KEY = os.getenv("X_API_KEY", "")
@@ -58,8 +59,9 @@ def _safe_folder_name(name: str) -> str:
         .replace(",,", ",").strip().strip(",") or "parcels"
 
 def _kmz_stream_response(features: List[Dict[str, Any]], folder_name: str):
-    safe_name = _safe_folder_name(folder_name or "parcels")
-    kmz_bytes = to_kmz(features, folder_name=safe_name)
+    display_name = folder_name or "parcels"
+    safe_name = _safe_folder_name(display_name)
+    kmz_bytes = to_kmz(features, folder_name=display_name)
     headers = {"Content-Disposition": f'attachment; filename="{safe_name}.kmz"'}
     return StreamingResponse(BytesIO(kmz_bytes), media_type="application/vnd.google-earth.kmz", headers=headers)
 
@@ -111,18 +113,18 @@ async def process_pdf_kmz(
                 uniq.append(f); seen.add(key)
         parcels = uniq
 
-    folder_name = None
+    folder_fallback = None
     addrs = parse_au_address_structured(text)
     if addrs and not parcels:
         for addr in addrs[:5]:
             base_label = addr["original"]
             if addr.get("property_name"):
                 if base_label.lower().startswith(addr["property_name"].lower()):
-                    folder_name = base_label
+                    folder_fallback = base_label
                 else:
-                    folder_name = f'{addr["property_name"]} {base_label}'
+                    folder_fallback = f'{addr["property_name"]} {base_label}'
             else:
-                folder_name = base_label
+                folder_fallback = base_label
             # Query via Address layer -> lotplan -> Parcels
             hits = query_parcels_from_address(addr, relax_no_number=relax_no_number, max_results=max_results)
             if hits:
@@ -132,10 +134,7 @@ async def process_pdf_kmz(
     if not parcels:
         raise HTTPException(404, "No parcels found for the extracted details.")
 
-    if not folder_name:
-        props = parcels[0].get("properties",{}) if parcels else {}
-        folder_name = props.get("lotplan") or "parcels"
-
+    folder_name = best_folder_name_from_parcels(parcels, folder_fallback)
     return _kmz_stream_response(parcels, folder_name)
 
 @app.get("/kmz_by_lotplan")
@@ -155,7 +154,8 @@ def kmz_by_lotplan(lotplan: str, max_results: int = Query(1000, ge=1, le=5000)):
         parcels.extend(query_parcels_by_lotplan(tok, max_results=max_results))
     if not parcels:
         raise HTTPException(404, "No parcels found for given Lot/Plan token(s).")
-    folder_name = " & ".join(unique_tokens)[:120] or "lotplans"
+    fallback = " & ".join(unique_tokens)[:120] or "lotplans"
+    folder_name = best_folder_name_from_parcels(parcels, fallback)
     return _kmz_stream_response(parcels, folder_name)
 
 @app.post("/kmz_by_address")
@@ -166,7 +166,7 @@ def kmz_by_address(query: AddressLookup):
     if not candidates:
         candidates = [{"original": query.address.strip()}]
     parcels: Optional[List[Dict[str, Any]]] = None
-    folder_label = query.property_name or (candidates[0].get("original") or query.address.strip())
+    fallback_label = query.property_name or (candidates[0].get("original") or query.address.strip())
     for candidate in candidates[:5]:
         candidate_payload = {**candidate}
         if query.property_name:
@@ -178,20 +178,22 @@ def kmz_by_address(query: AddressLookup):
             hits = []
         if hits:
             parcels = hits
-            folder_label = candidate_payload.get("original") or folder_label
+            fallback_label = candidate_payload.get("original") or fallback_label
             break
     if not parcels:
         raise HTTPException(404, "No parcels found for the provided address.")
-    if query.property_name and folder_label:
-        folder_label = f"{query.property_name} {folder_label}"
-    return _kmz_stream_response(parcels, folder_label or "address")
+    if query.property_name and fallback_label:
+        fallback_label = f"\"{query.property_name}\", {fallback_label}"
+    folder_name = best_folder_name_from_parcels(parcels, fallback_label or "address")
+    return _kmz_stream_response(parcels, folder_name)
 
 @app.post("/kmz_by_address_fields")
 def kmz_by_address_fields(addr: AddressIn, max_results: int = Query(1000, ge=1, le=5000), relax_no_number: bool = Query(False)):
     hits = query_parcels_from_address(addr.model_dump(), relax_no_number=relax_no_number, max_results=max_results)
     if not hits:
         raise HTTPException(404, "No parcels found from provided address.")
-    folder_name = (addr.property_name + " " if addr.property_name else "") + (
-        addr.original or f"{addr.house_number or ''} {addr.street or ''}, {addr.suburb or ''}, {addr.state or 'QLD'} {addr.postcode or ''}"
-    )
+    fallback = addr.original or f"{addr.house_number or ''} {addr.street or ''}, {addr.suburb or ''}, {addr.state or 'QLD'} {addr.postcode or ''}"
+    if addr.property_name:
+        fallback = f"\"{addr.property_name}\", {fallback}"
+    folder_name = best_folder_name_from_parcels(hits, fallback)
     return _kmz_stream_response(hits, folder_name)

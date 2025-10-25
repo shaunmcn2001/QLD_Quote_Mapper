@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from shapely.geometry import shape, Polygon, MultiPolygon, GeometryCollection, mapping
 from shapely.ops import unary_union
 import simplekml
+from functools import lru_cache
 
 BASE_MAPSERVER = os.getenv("QLD_MAPSERVER_BASE", "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer")
 ADDRESS_LAYER = int(os.getenv("QLD_ADDRESS_LAYER", "0"))
@@ -82,6 +83,91 @@ def normalize_lotplan(token: str) -> str:
     if not parsed:
         raise ValueError(f"Unsupported lot/plan token: {token}")
     return parsed[0]
+
+def _format_address_label(attrs: Dict[str, Any]) -> Optional[str]:
+    if not attrs:
+        return None
+    prop_name = (attrs.get("property_name") or "").strip()
+    street_no = (attrs.get("street_number") or attrs.get("street_no_1") or "").strip()
+    street_full = (attrs.get("street_full") or "").strip()
+    street_name = (attrs.get("street_name") or "").strip()
+    street_type = (attrs.get("street_type") or "").strip()
+    street_suffix = (attrs.get("street_suffix") or "").strip()
+    locality = (attrs.get("locality") or "").strip()
+    state = (attrs.get("state") or "").strip()
+
+    street_parts: List[str] = []
+    if street_no:
+        street_parts.append(street_no)
+    if street_full:
+        street_parts.append(street_full)
+    else:
+        textual = " ".join(part for part in [street_name, street_type, street_suffix] if part)
+        if textual:
+            street_parts.append(textual.strip())
+
+    address_components = []
+    if street_parts:
+        address_components.append(" ".join(street_parts).strip())
+    addr_field = (attrs.get("address") or "").strip()
+    if not address_components and addr_field:
+        # As a fallback use the raw address string
+        address_components.append(addr_field)
+    if locality:
+        address_components.append(locality)
+    if state:
+        address_components.append(state)
+
+    if not address_components:
+        return None
+    label = ", ".join(comp for comp in address_components if comp)
+    if prop_name:
+        return f"\"{prop_name}\", {label}"
+    return label
+
+@lru_cache(maxsize=1024)
+def _address_label_for_lotplan(lotplan: str) -> Optional[str]:
+    clean = (lotplan or "").strip()
+    if not clean:
+        return None
+    try:
+        clean = normalize_lotplan(clean)
+    except ValueError:
+        pass
+    where = f"UPPER({ADDR['lotplan']}) = UPPER('{_sql_escape(clean)}')"
+    data = _query(ADDRESS_LAYER, {"where": where, "resultRecordCount": 1})
+    for feat in data.get("features", []):
+        label = _format_address_label(feat.get("properties", {}) or {})
+        if label:
+            return label
+    return None
+
+def best_folder_name_from_parcels(parcels: List[Dict[str, Any]], fallback: Optional[str] = None) -> str:
+    seen: set[str] = set()
+    for feat in parcels:
+        props = feat.get("properties", {}) or {}
+        lotplan = (props.get(PAR["lotplan"]) or "").strip()
+        if not lotplan:
+            continue
+        if lotplan in seen:
+            continue
+        seen.add(lotplan)
+        norm_lp = lotplan
+        try:
+            norm_lp = normalize_lotplan(lotplan)
+        except ValueError:
+            pass
+        label = _address_label_for_lotplan(norm_lp)
+        if label:
+            return label
+    if fallback and fallback.strip():
+        return fallback.strip()
+    for feat in parcels:
+        props = feat.get("properties", {}) or {}
+        lotplan = (props.get(PAR["lotplan"]) or "").strip()
+        if lotplan:
+            return lotplan
+    return "parcels"
 
 def address_where(addr: Dict[str,Any], relax_no_number: bool=False) -> str:
     parts = []
