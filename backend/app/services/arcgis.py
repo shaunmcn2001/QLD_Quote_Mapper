@@ -320,8 +320,16 @@ def _add_feature_to_folder(kml_folder, f):
     if not geom: return
     shp = shape(geom)
     name = props.get(PAR["lotplan"]) or f"Parcel {props.get(PAR['objectid'],'')}" or "parcel"
-    keep = ["lot","plan","lotplan","shire_name","locality","tenure"]
-    desc_lines = [f"{k}: {props.get(k)}" for k in keep if props.get(k) not in (None, "")]
+    desc_lines = []
+    if props.get(PAR["lotplan"]):
+        desc_lines.append(f"Lot/Plan: {props.get(PAR['lotplan'])}")
+    lot_area = props.get("lot_area")
+    if lot_area not in (None, ""):
+        try:
+            hectares = float(lot_area) / 10000.0
+            desc_lines.append(f"Lot Area: {hectares:.2f} ha")
+        except (TypeError, ValueError):
+            pass
     desc = "\n".join(desc_lines)
     polygons = _collect_polygons(shp)
     if polygons:
