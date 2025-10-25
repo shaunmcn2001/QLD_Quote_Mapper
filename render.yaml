@@ -13,17 +13,13 @@ services:
       - key: ARCGIS_AUTH_TOKEN
         value: ""
 
-  - type: static_site
-    name: parcel-agent-frontend
-    env: static
+staticSites:
+  - name: parcel-agent-frontend
     branch: main
     buildCommand: npm install && npm run build
     publishPath: dist
     envVars:
       - key: VITE_API_BASE
-        fromService:
-          name: parcel-agent-api
-          type: web
-          property: url
+        value: https://parcel-agent-api.onrender.com
       - key: VITE_API_KEY
         value: Qldmapper2025
