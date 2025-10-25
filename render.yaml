@@ -13,9 +13,8 @@ services:
       - key: ARCGIS_AUTH_TOKEN
         value: ""
 
-  - type: static_site
+  - type: static
     name: parcel-agent-frontend
-    plan: free
     branch: main
     buildCommand: npm install && npm run build
     publishPath: dist
