@@ -7,7 +7,7 @@ import simplekml
 
 BASE_MAPSERVER = os.getenv("QLD_MAPSERVER_BASE", "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer")
 ADDRESS_LAYER = int(os.getenv("QLD_ADDRESS_LAYER", "0"))
-PARCELS_LAYER = int(os.getenv("QLD_PARCELS_LAYER", "4"))
+PARCELS_LAYER = int(os.getenv("QLD_PARCELS_LAYER", "3"))
 ARCGIS_TOKEN = os.getenv("ARCGIS_AUTH_TOKEN","")
 
 ADDR = {
@@ -77,8 +77,8 @@ def _parse_lotplan_token(token: str) -> Optional[Tuple[str, str, str]]:
     if prefix not in _PLAN_PREFIXES:
         return None
     plan = f"{prefix}{number}"
-    lotplan = f"{lot} {plan}"
-    return lotplan, lot, plan
+    compact = f"{lot}{plan}"
+    return compact, lot, plan
 
 def normalize_lotplan(token: str) -> str:
     parsed = _parse_lotplan_token(token)
@@ -114,9 +114,12 @@ def resolve_lotplans_from_address(addr: Dict[str,Any], relax_no_number: bool=Fal
     pt: Optional[Tuple[float,float]] = None
     for f in feats:
         p = f.get("properties", {}) or {}
-        lp = (p.get(ADDR["lotplan"]) or "").strip()
-        if lp:
-            lps.append(lp.upper())
+        lp_raw = (p.get(ADDR["lotplan"]) or "").strip()
+        if lp_raw:
+            try:
+                lps.append(normalize_lotplan(lp_raw))
+            except ValueError:
+                lps.append(lp_raw.upper())
         lat = p.get(ADDR["latitude"]); lon = p.get(ADDR["longitude"])
         if lat is not None and lon is not None and pt is None:
             try:
@@ -129,8 +132,8 @@ def resolve_lotplans_from_address(addr: Dict[str,Any], relax_no_number: bool=Fal
 def query_parcels_by_lotplan(lotplan_token: str, max_results: int=500) -> List[Dict[str,Any]]:
     parsed = _parse_lotplan_token(lotplan_token)
     if parsed:
-        _, lot, plan = parsed
-        where = f"UPPER({PAR['lot']}) = UPPER('{_sql_escape(lot)}') AND UPPER({PAR['plan']}) = UPPER('{_sql_escape(plan)}')"
+        lotplan_compact, _, _ = parsed
+        where = f"UPPER({PAR['lotplan']}) = UPPER('{_sql_escape(lotplan_compact)}')"
     else:
         lp = _sql_escape(lotplan_token.strip().upper())
         where = f"UPPER({PAR['lotplan']}) LIKE '%{lp}%'"
