@@ -2,15 +2,17 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body, Reque
 from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Iterable
 from io import BytesIO
 import re
 import os
+import base64
 
 from app.services.pdf_address import (
     parse_lotplan_from_text,
     parse_au_address_structured,
     extract_pdf_insights,
+    extract_text_insights,
 )
 from app.services.arcgis import (
     query_parcels_by_point,
@@ -60,6 +62,19 @@ class GroupedKmzRequest(BaseModel):
     default_label: Optional[str] = None
     max_results: int = 1000
 
+class EmailAttachment(BaseModel):
+    filename: str
+    content_type: Optional[str] = None
+    content_base64: str
+
+class EmailParcelRequest(BaseModel):
+    subject: Optional[str] = None
+    body_text: Optional[str] = None
+    body_html: Optional[str] = None
+    relax_no_number: bool = False
+    max_results: int = 1000
+    attachments: Optional[List[EmailAttachment]] = None
+
 _LOTPLAN_FINDER = re.compile(
     r"\d+[A-Z]?(?:\s*/\s*|\s*[-]?\s*)?[A-Z]{1,4}\s*\d+",
     re.IGNORECASE,
@@ -84,6 +99,149 @@ def _extract_lotplan_tokens(raw: str) -> List[str]:
     if tokens:
         return tokens
     return [m.group(0) for m in _LOTPLAN_FINDER.finditer(raw)]
+
+_HTML_BREAK = re.compile(r"(?i)<\s*(br|/p)\s*>")
+_HTML_TAG = re.compile(r"<[^>]+>")
+
+def _html_to_text(html: Optional[str]) -> str:
+    if not html:
+        return ""
+    text = _HTML_BREAK.sub("\n", html)
+    text = _HTML_TAG.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def _resolve_insights_to_parcels(
+    insights_iter: Iterable[Dict[str, Any]],
+    max_results: int,
+    relax_no_number: bool,
+) -> Dict[str, Any]:
+    grouped_features: Dict[str, List[Dict[str, Any]]] = {}
+    all_parcels: List[Dict[str, Any]] = []
+    ungrouped_parcels: List[Dict[str, Any]] = []
+    group_labels: List[str] = []
+    processed_tokens: set[str] = set()
+    used_addresses: set[str] = set()
+    fallback_texts: List[str] = []
+
+    insights_list = [ins for ins in insights_iter if ins]
+
+    for insight in insights_list:
+        for page in insight.get("pages", []) or []:
+            text = page.get("text")
+            if text:
+                fallback_texts.append(text)
+
+        groups = insight.get("address_lotplan_groups", []) or []
+        for group in groups:
+            structured_addr = group.get("address") or {}
+            raw_address = group.get("raw_address") or structured_addr.get("original")
+            lot_tokens = group.get("lotplans") or []
+            relax_flag = group.get("relax_no_number", relax_no_number)
+            group_parcels: List[Dict[str, Any]] = []
+            for token in lot_tokens:
+                raw_token = token.strip()
+                if not raw_token:
+                    continue
+                try:
+                    norm_token = normalize_lotplan(raw_token)
+                except ValueError:
+                    norm_token = raw_token.replace(" ", "").upper()
+                if norm_token in processed_tokens:
+                    continue
+                processed_tokens.add(norm_token)
+                group_parcels.extend(query_parcels_by_lotplan(norm_token, max_results=max_results))
+            if not group_parcels and structured_addr:
+                try:
+                    group_parcels = query_parcels_from_address(structured_addr, relax_no_number=relax_flag, max_results=max_results)
+                except ValueError:
+                    group_parcels = []
+            if group_parcels:
+                folder_label = best_folder_name_from_parcels(group_parcels, raw_address)
+                grouped_features.setdefault(folder_label, []).extend(group_parcels)
+                group_labels.append(folder_label)
+                all_parcels.extend(group_parcels)
+                if structured_addr.get("original"):
+                    used_addresses.add(structured_addr["original"])
+
+        lotplan_records = insight.get("lotplans", []) or []
+        for record in lotplan_records:
+            token = record.get("lotplan", "")
+            if not token:
+                continue
+            try:
+                norm = normalize_lotplan(token)
+            except ValueError:
+                norm = token.replace(" ", "").upper()
+            if norm in processed_tokens:
+                continue
+            processed_tokens.add(norm)
+            hits = query_parcels_by_lotplan(norm, max_results=max_results)
+            if hits:
+                ungrouped_parcels.extend(hits)
+                all_parcels.extend(hits)
+
+        address_records = insight.get("addresses", []) or []
+        for record in address_records:
+            addr = record.get("address") or {}
+            original = addr.get("original")
+            if original and original in used_addresses:
+                continue
+            try:
+                hits = query_parcels_from_address(addr, relax_no_number=relax_no_number, max_results=max_results)
+            except ValueError:
+                hits = []
+            if hits:
+                folder_label = best_folder_name_from_parcels(hits, original or addr.get("street"))
+                grouped_features.setdefault(folder_label, []).extend(hits)
+                group_labels.append(folder_label)
+                all_parcels.extend(hits)
+                if original:
+                    used_addresses.add(original)
+
+    if not all_parcels:
+        combined = "\n".join(fallback_texts)
+        lotplans = parse_lotplan_from_text(combined)
+        for lp in lotplans[:100]:
+            try:
+                norm = normalize_lotplan(lp)
+            except ValueError:
+                norm = lp.replace(" ", "").upper()
+            if norm in processed_tokens:
+                continue
+            processed_tokens.add(norm)
+            hits = query_parcels_by_lotplan(norm, max_results=max_results)
+            if hits:
+                ungrouped_parcels.extend(hits)
+                all_parcels.extend(hits)
+        if not all_parcels:
+            text_addresses = parse_au_address_structured(combined)
+            for addr in text_addresses[:5]:
+                try:
+                    hits = query_parcels_from_address(addr, relax_no_number=relax_no_number, max_results=max_results)
+                except ValueError:
+                    hits = []
+                if hits:
+                    folder_label = best_folder_name_from_parcels(hits, addr.get("original"))
+                    grouped_features.setdefault(folder_label, []).extend(hits)
+                    group_labels.append(folder_label)
+                    all_parcels.extend(hits)
+                    break
+
+    if not all_parcels:
+        raise HTTPException(404, "No parcels found for the extracted details.")
+
+    folder_name = None
+    if group_labels:
+        folder_name = " & ".join(dict.fromkeys(group_labels))[:120] or None
+    if not folder_name:
+        folder_name = best_folder_name_from_parcels(all_parcels, None)
+
+    return {
+        "folder_name": folder_name,
+        "grouped_features": grouped_features or None,
+        "ungrouped_parcels": ungrouped_parcels,
+        "all_parcels": all_parcels,
+    }
 
 @app.middleware("http")
 async def require_key(request: Request, call_next):
@@ -164,117 +322,52 @@ async def process_pdf_kmz(
         raise HTTPException(400, "Please upload a PDF file.")
     content = await pdf.read()
     insights = extract_pdf_insights(content)
-    pages = insights.get("pages", [])
-    full_text = "\n".join(page.get("text", "") for page in pages)
+    resolved = _resolve_insights_to_parcels([insights], max_results=max_results, relax_no_number=relax_no_number)
+    return _kmz_stream_response(
+        resolved["ungrouped_parcels"],
+        resolved["folder_name"],
+        grouped=resolved["grouped_features"],
+    )
 
-    grouped_features: Dict[str, List[Dict[str, Any]]] = {}
-    all_parcels: List[Dict[str, Any]] = []
-    ungrouped_parcels: List[Dict[str, Any]] = []
-    processed_tokens: set[str] = set()
-    used_addresses: set[str] = set()
-    group_labels: List[str] = []
+@app.post("/kmz_from_email")
+def kmz_from_email(payload: EmailParcelRequest):
+    texts: List[str] = []
+    if payload.body_text:
+        texts.append(payload.body_text)
+    if payload.body_html:
+        texts.append(_html_to_text(payload.body_html))
+    combined_text = "\n".join(part for part in texts if part)
+    insights: List[Dict[str, Any]] = []
+    if combined_text.strip():
+        insights.append(extract_text_insights(combined_text))
 
-    groups = insights.get("address_lotplan_groups", []) or []
-    for group in groups:
-        structured_addr = group.get("address") or {}
-        raw_address = group.get("raw_address") or (structured_addr.get("original") if structured_addr else None)
-        lot_tokens = group.get("lotplans") or []
-        group_parcels: List[Dict[str, Any]] = []
-        for token in lot_tokens:
-            raw_token = token.strip()
-            if not raw_token:
-                continue
+    for attachment in payload.attachments or []:
+        filename = attachment.filename or "attachment"
+        content_type = (attachment.content_type or "").lower()
+        if content_type.startswith("application/pdf") or filename.lower().endswith(".pdf"):
             try:
-                norm_token = normalize_lotplan(raw_token)
-            except ValueError:
-                norm_token = raw_token.replace(" ", "").upper()
-            if norm_token in processed_tokens:
-                continue
-            processed_tokens.add(norm_token)
-            group_parcels.extend(query_parcels_by_lotplan(norm_token, max_results=max_results))
-        if not group_parcels and structured_addr:
+                data = base64.b64decode(attachment.content_base64)
+            except Exception as exc:
+                raise HTTPException(400, f"Failed to decode attachment {filename}: {exc}") from exc
             try:
-                group_parcels = query_parcels_from_address(structured_addr, relax_no_number=relax_no_number, max_results=max_results)
-            except ValueError:
-                group_parcels = []
-        if group_parcels:
-            fallback_label = raw_address or structured_addr.get("original")
-            folder_label = best_folder_name_from_parcels(group_parcels, fallback_label)
-            grouped_features.setdefault(folder_label, []).extend(group_parcels)
-            group_labels.append(folder_label)
-            all_parcels.extend(group_parcels)
-            if structured_addr.get("original"):
-                used_addresses.add(structured_addr["original"])
+                insights.append(extract_pdf_insights(data))
+            except Exception as exc:
+                raise HTTPException(500, f"Failed to analyze attachment {filename}: {exc}") from exc
 
-    lotplan_records = insights.get("lotplans", []) or []
-    for record in lotplan_records:
-        token = record.get("lotplan", "")
-        if not token:
-            continue
-        try:
-            norm = normalize_lotplan(token)
-        except ValueError:
-            norm = token.replace(" ", "").upper()
-        if norm in processed_tokens:
-            continue
-        processed_tokens.add(norm)
-        hits = query_parcels_by_lotplan(norm, max_results=max_results)
-        ungrouped_parcels.extend(hits)
-        all_parcels.extend(hits)
+    if not insights:
+        raise HTTPException(400, "Email content does not contain parsable text or supported attachments.")
 
-    # Remaining addresses not already used by groups
-    address_records = insights.get("addresses", []) or []
-    for record in address_records:
-        addr = record.get("address") or {}
-        original = addr.get("original")
-        if original and original in used_addresses:
-            continue
-        try:
-            hits = query_parcels_from_address(addr, relax_no_number=relax_no_number, max_results=max_results)
-        except ValueError:
-            hits = []
-        if hits:
-            folder_label = best_folder_name_from_parcels(hits, original or addr.get("street"))
-            grouped_features.setdefault(folder_label, []).extend(hits)
-            group_labels.append(folder_label)
-            all_parcels.extend(hits)
-            if original:
-                used_addresses.add(original)
-
-    # Fallback: try parsing text directly if insights missed something
-    if not all_parcels:
-        lotplans = parse_lotplan_from_text(full_text)
-        for lp in lotplans[:100]:
-            try:
-                norm = normalize_lotplan(lp)
-            except ValueError:
-                norm = lp.replace(" ", "").upper()
-            hits = query_parcels_by_lotplan(norm, max_results=max_results)
-            ungrouped_parcels.extend(hits)
-            all_parcels.extend(hits)
-        if not all_parcels:
-            text_addresses = parse_au_address_structured(full_text)
-            for addr in text_addresses[:5]:
-                try:
-                    hits = query_parcels_from_address(addr, relax_no_number=relax_no_number, max_results=max_results)
-                except ValueError:
-                    hits = []
-                if hits:
-                    folder_label = best_folder_name_from_parcels(hits, addr.get("original"))
-                    grouped_features.setdefault(folder_label, []).extend(hits)
-                    group_labels.append(folder_label)
-                    all_parcels.extend(hits)
-                    break
-
-    if not all_parcels:
-        raise HTTPException(404, "No parcels found for the extracted details.")
-
-    folder_name = None
-    if group_labels:
-        folder_name = " & ".join(dict.fromkeys(group_labels))[:120] or None
-    if not folder_name:
-        folder_name = best_folder_name_from_parcels(all_parcels, None)
-    return _kmz_stream_response(ungrouped_parcels, folder_name, grouped=grouped_features or None)
+    resolved = _resolve_insights_to_parcels(
+        insights,
+        max_results=payload.max_results,
+        relax_no_number=payload.relax_no_number,
+    )
+    folder_label = payload.subject.strip() if payload.subject and payload.subject.strip() else resolved["folder_name"]
+    return _kmz_stream_response(
+        resolved["ungrouped_parcels"],
+        folder_label,
+        grouped=resolved["grouped_features"],
+    )
 
 @app.get("/kmz_by_lotplan")
 def kmz_by_lotplan(lotplan: str, max_results: int = Query(1000, ge=1, le=5000)):

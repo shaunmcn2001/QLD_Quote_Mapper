@@ -175,6 +175,59 @@ def extract_pdf_insights(pdf_bytes: bytes) -> Dict[str, Any]:
         "address_lotplan_groups": sorted(groups, key=lambda g: g["page_number"]),
     }
 
+def extract_text_insights(text: str) -> Dict[str, Any]:
+    pages = [{"page_number": 1, "text": text or "", "source": "email"}]
+    lotplan_records: List[Dict[str, Any]] = []
+    address_records: List[Dict[str, Any]] = []
+    groups: List[Dict[str, Any]] = []
+    seen_lotplans: Dict[str, Dict[str, Any]] = {}
+    seen_addresses: Dict[Tuple, Dict[str, Any]] = {}
+    seen_groups: set[Tuple[str, Tuple[str, ...]]] = set()
+
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for idx, line in enumerate(lines, start=1):
+        grp = parse_address_and_lotplans(line)
+        if grp:
+            lots_tuple = tuple(grp["lotplans"])
+            key = (grp["raw_address"].upper(), lots_tuple)
+            if key not in seen_groups:
+                groups.append({
+                    **grp,
+                    "page_number": idx,
+                    "extraction_source": "email",
+                })
+                seen_groups.add(key)
+
+        for lp in parse_lotplan_from_text(line):
+            lp_norm = lp.upper()
+            if lp_norm not in seen_lotplans:
+                seen_lotplans[lp_norm] = {
+                    "lotplan": lp_norm,
+                    "page_number": idx,
+                    "extraction_source": "email",
+                }
+
+        for addr in parse_au_address_structured(line):
+            key = _address_key(addr)
+            if key not in seen_addresses:
+                seen_addresses[key] = {
+                    "page_number": idx,
+                    "extraction_source": "email",
+                    "address": addr,
+                }
+
+    return {
+        "summary": {
+            "total_pages": 1,
+            "lotplans_found": len(seen_lotplans),
+            "addresses_found": len(seen_addresses),
+        },
+        "pages": pages,
+        "lotplans": sorted(seen_lotplans.values(), key=lambda r: (r["page_number"], r["lotplan"])),
+        "addresses": sorted(seen_addresses.values(), key=lambda r: r["page_number"]),
+        "address_lotplan_groups": sorted(groups, key=lambda g: g["page_number"]),
+    }
+
 _LOTPLAN_PATTERN = re.compile(
     r"(?:(?:LOT|L)\s*(\d+[A-Z]?)(?:\s*ON)?)\s*(?:[-/\\]|\s)+([A-Z]{1,4}\d+)",
     re.IGNORECASE,
